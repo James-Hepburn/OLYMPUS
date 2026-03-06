@@ -222,6 +222,18 @@ class GameState: ObservableObject {
     /// Also appended to `gameLog` for a full session history.
     @Published var message: String = ""
 
+    /// Queue of pending log messages waiting to be displayed.
+    /// Messages are drained one at a time with a minimum on-screen duration
+    /// so the player always has time to read each one.
+    private var messageQueue: [String] = []
+
+    /// True while a message is being held on screen for its minimum duration.
+    /// Guards against the drain loop consuming entries faster than they can be read.
+    private var isDisplayingMessage = false
+
+    /// Minimum time (seconds) each message stays on screen before the next replaces it.
+    private let messageDisplayDuration: TimeInterval = 1.6
+
     /// A rolling history of the last 30 game events. Capped to prevent
     /// unbounded memory growth in long matches.
     @Published var gameLog: [String] = []
@@ -237,6 +249,27 @@ class GameState: ObservableObject {
     /// The game mode selected at launch. Not published because it never
     /// changes during a match — it only needs to be read, not observed.
     var mode: GameMode
+
+    /// IDs of creatures currently under Sisyphus's Burden. A creature in this
+    /// set skips its next `canAttack = true` reset at the end of the **opponent's**
+    /// turn (i.e. the turn after the spell is cast), then is removed from the set
+    /// so normal attack eligibility resumes thereafter. Keyed by card `id` so
+    /// token copies of the same card template are tracked independently.
+    var burdenedCreatureIDs: Set<String> = []
+    
+    /// IDs of creatures currently under Prometheus's Fire. A creature in this
+    /// set loses its `+2` attack bonus at the end of the **players's**
+    /// turn (i.e. the turn after the spell is cast), then is removed from the set
+    /// so normal attack power resumes thereafter. Keyed by card `id` so
+    /// token copies of the same card template are tracked independently.
+    var fireCreatureIDs: Set<String> = []
+
+    /// IDs of creatures that currently have Athena's Divine Shield active.
+    /// A creature is added here when it enters the board as Athena (or is revived).
+    /// When it absorbs a hit, its ID is removed — the shield is permanently gone.
+    /// Health values are NEVER modified for shield purposes; this set is the
+    /// single source of truth for whether the shield is active.
+    var shieldedCreatureIDs: Set<String> = []
 
     // MARK: Initialiser
 
@@ -323,12 +356,42 @@ class GameState: ObservableObject {
         // `canAttack = true` is set here (not at turn start) so that newly
         // played creatures gain attack eligibility on the *opponent's next turn*,
         // correctly implementing summoning sickness.
+        //
+        // Sisyphus's Burden: creatures whose IDs are in `burdenedCreatureIDs` skip
+        // their `canAttack = true` reset this cycle (keeping them unable to attack
+        // for the upcoming turn). Their ID is then removed from the set so they
+        // recover normally on the following turn.
+        //
+        // Prometheus's Fire: creatures whose IDs are in `fireCreatureIDs` lose
+        // their `+2` attack bonus (taking away the effect of the spell at
+        // the end of their turn). Their ID is then removed from the set so they
+        // have their normal attack power on the following turn.
         for i in player.board.indices {
-            player.board [i].canAttack = true
+            let id = player.board [i].id
+            if burdenedCreatureIDs.contains (id) {
+                player.board [i].canAttack = false
+                burdenedCreatureIDs.remove (id)
+            } else {
+                player.board [i].canAttack = true
+            }
+            if fireCreatureIDs.contains (id) {
+                player.board [i].currentAttack? -= 2
+                fireCreatureIDs.remove (id)
+            }
             player.board [i].currentHealth = player.board [i].health ?? 0
         }
         for i in opponent.board.indices {
-            opponent.board [i].canAttack = true
+            let id = opponent.board [i].id
+            if burdenedCreatureIDs.contains (id) {
+                opponent.board [i].canAttack = false
+                burdenedCreatureIDs.remove (id)
+            } else {
+                opponent.board [i].canAttack = true
+            }
+            if fireCreatureIDs.contains (id) {
+                opponent.board [i].currentAttack? -= 2
+                fireCreatureIDs.remove (id)
+            }
             opponent.board [i].currentHealth = opponent.board [i].health ?? 0
         }
 
@@ -397,12 +460,20 @@ class GameState: ObservableObject {
 
             case "Sisyphus's Burden":
                 guard !opponent.board.isEmpty else { log ("No enemy creatures."); return }
+                if opponent.board.contains (where: { $0.name == "Poseidon" }) {
+                    log ("Poseidon protects all enemy creatures — Sisyphus's Burden fizzles!")
+                    return
+                }
                 targetingMode = .selectingOpponentCreature (spell: card.name, cardIndex: index)
                 log ("Pick an enemy creature to prevent from attacking.")
                 return
 
             case "Curse of Circe":
                 guard !opponent.board.isEmpty else { log ("No enemy creatures."); return }
+                if opponent.board.contains (where: { $0.name == "Poseidon" }) {
+                    log ("Poseidon protects all enemy creatures — Curse of Circe fizzles!")
+                    return
+                }
                 targetingMode = .selectingOpponentCreature (spell: card.name, cardIndex: index)
                 log ("Pick an enemy creature to transform into a pig.")
                 return
@@ -446,14 +517,17 @@ class GameState: ObservableObject {
                 return
 
             case "Heracles":
-                // Heracles can only target creatures with 2 or less health.
-                // If valid targets exist, enter targeting mode; otherwise fall
-                // through to play him as a plain creature.
-                let validTargets = opponent.board.filter { ($0.currentHealth ?? 0) <= 2 }
-                if !validTargets.isEmpty {
-                    targetingMode = .selectingOpponentCreature (spell: "Heracles", cardIndex: index)
-                    log ("Pick an enemy creature with 2 or less health to destroy.")
-                    return
+                // Heracles can only use his destroy ability if Poseidon isn't protecting
+                // the opponent's board. If blocked, he still enters as a plain 4/4.
+                if !opponent.board.contains (where: { $0.name == "Poseidon" }) {
+                    let validTargets = opponent.board.filter { ($0.currentHealth ?? 0) <= 2 }
+                    if !validTargets.isEmpty {
+                        targetingMode = .selectingOpponentCreature (spell: "Heracles", cardIndex: index)
+                        log ("Pick an enemy creature with 2 or less health to destroy.")
+                        return
+                    }
+                } else if opponent.board.contains (where: { ($0.currentHealth ?? 0) <= 2 }) {
+                    log ("Poseidon protects enemy creatures — Heracles enters as a plain 4/4.")
                 }
 
             default:
@@ -493,6 +567,7 @@ class GameState: ObservableObject {
             if player.hasAres () && card.name != "Ares" {
                 played.currentAttack = (played.currentAttack ?? 0) + 1
             }
+            if card.name == "Athena" { shieldedCreatureIDs.insert (played.id) }
             player.board.append (played)
             log ("You played \(card.name).")
             resolvePlayerPlayEffect (card)
@@ -512,9 +587,17 @@ class GameState: ObservableObject {
     func resolvePlayerPlayEffect (_ card: Card) {
         switch card.name {
         case "Zeus":
-            // Zeus deals 2 damage to all opponent creatures on entry.
+            // Zeus is a CREATURE ability — Poseidon only blocks spells.
+            // Zeus AoE always hits regardless of whether Poseidon is in play.
+            // Athena's Divine Shield absorbs the hit: shield breaks, zero damage to Athena.
             for i in opponent.board.indices {
-                opponent.board [i].currentHealth = (opponent.board [i].currentHealth ?? 0) - 2
+                let dmg = opponent.board [i].name == "Achilles" ? 4 : 2
+                if opponent.board [i].name == "Athena" && shieldedCreatureIDs.contains (opponent.board [i].id) {
+                    shieldedCreatureIDs.remove (opponent.board [i].id)
+                    log ("Zeus's lightning strikes Athena's Divine Shield!")
+                } else {
+                    opponent.board [i].currentHealth = (opponent.board [i].currentHealth ?? 0) - dmg
+                }
             }
             removeDeadOpponentCreatures ()
             log ("Zeus strikes all enemies for 2!")
@@ -576,6 +659,8 @@ class GameState: ObservableObject {
             // Temporary +2 attack — only `currentAttack` is modified.
             player.board [boardIndex].currentAttack = (player.board [boardIndex].currentAttack ?? 0) + 2
             log ("Prometheus's Fire gives \(player.board [boardIndex].name) +2 attack!")
+            let fireID = player.board [boardIndex].id
+            fireCreatureIDs.insert (fireID)
 
         case "Shield of Sparta":
             // Permanent +3 health — both `currentHealth` and base `health` are
@@ -611,12 +696,18 @@ class GameState: ObservableObject {
 
         switch spell {
         case "Sisyphus's Burden":
-            // Prevent the targeted creature from attacking this turn.
+            // Prevent the targeted creature from attacking next turn by registering
+            // its ID in `burdenedCreatureIDs`. Setting `canAttack = false` here also
+            // stops it attacking for the remainder of the current opponent turn if
+            // this spell is cast reactively; `endTurn` will then honour the burden
+            // flag to skip the next `canAttack = true` reset.
             player.spendMana (cost)
             player.hand.remove (at: cardIndex)
+            let burdenedID = opponent.board [boardIndex].id
             opponent.board [boardIndex].canAttack = false
+            burdenedCreatureIDs.insert (burdenedID)
             player.discard.append (card)
-            log ("Sisyphus's Burden stops \(opponent.board [boardIndex].name) from attacking!")
+            log ("Sisyphus's Burden stops \(opponent.board [boardIndex].name) from attacking next turn!")
             selectedCardIndex = nil
             targetingMode = .none
 
@@ -626,9 +717,17 @@ class GameState: ObservableObject {
             // is no unintended summoning sickness if the creature was already ready.
             player.spendMana (cost)
             player.hand.remove (at: cardIndex)
+            let transformedName = opponent.board [boardIndex].name
             var pig = Card (name: "Pig", type: .monster, manaCost: 1, imageName: "pig", description: "A transformed 1/1 pig.", attack: 1, health: 1)
             pig.canAttack = opponent.board [boardIndex].canAttack
+            opponent.discard.append (opponent.board [boardIndex])
             opponent.board [boardIndex] = pig
+            // If the transformed creature was Ares, remove his +1 bonus from the board
+            if transformedName == "Ares" {
+                for i in opponent.board.indices where opponent.board[i].name != "Pig" || i != boardIndex {
+                    opponent.board[i].currentAttack? -= 1
+                }
+            }
             player.discard.append (card)
             log ("Curse of Circe transforms an enemy into a pig!")
             selectedCardIndex = nil
@@ -695,9 +794,15 @@ class GameState: ObservableObject {
                 log ("Poseidon protects opponent creatures from spells!")
             } else {
                 let name = opponent.board [bi].name
-                opponent.board [bi].currentHealth = (opponent.board [bi].currentHealth ?? 0) - 3
-                log ("Lightning Bolt hits \(name) for 3!")
-                removeDeadOpponentCreatures ()
+                let boltDmg = name == "Achilles" ? 6 : 3   // Double damage to Achilles.
+                if name == "Athena" && shieldedCreatureIDs.contains (opponent.board [bi].id) {
+                    shieldedCreatureIDs.remove (opponent.board [bi].id)
+                    log ("Lightning Bolt hit Athena's Divine Shield!")
+                } else {
+                    opponent.board [bi].currentHealth = (opponent.board [bi].currentHealth ?? 0) - boltDmg
+                    log ("Lightning Bolt hits \(name) for \(boltDmg)!")
+                    removeDeadOpponentCreatures ()
+                }
             }
         }
         checkWinCondition ()
@@ -762,7 +867,15 @@ class GameState: ObservableObject {
         revived.currentHealth = chosen.health
         revived.currentAttack = chosen.attack
         revived.canAttack = false   // Summoning sickness applies even to revived creatures.
+        if revived.name == "Perseus" { revived.canAttack = true }
+        if revived.name == "Athena"  { revived.id = UUID ().uuidString; shieldedCreatureIDs.insert (revived.id) }
         if player.hasAres () { revived.currentAttack = (revived.currentAttack ?? 0) + 1 }
+        // If the revived creature IS Ares, grant +1 attack to all existing board creatures.
+        if revived.name == "Ares" {
+            for i in player.board.indices {
+                player.board [i].currentAttack = (player.board [i].currentAttack ?? 0) + 1
+            }
+        }
         player.board.append (revived)
         player.discard.append (card)
         log ("Necromancy revives \(revived.name)!")
@@ -788,9 +901,15 @@ class GameState: ObservableObject {
                 log ("Poseidon protects all creatures — Tide blocked!")
             } else {
                 for i in passive.board.indices {
-                    passive.board [i].currentHealth = (passive.board [i].currentHealth ?? 0) - 2
+                    let dmg = passive.board [i].name == "Achilles" ? 4 : 2
+                    if passive.board [i].name == "Athena" && shieldedCreatureIDs.contains (passive.board [i].id) {
+                        shieldedCreatureIDs.remove (passive.board [i].id)
+                        log ("Poseidon's Tide hit Athena's Divine Shield!")
+                    } else {
+                        passive.board [i].currentHealth = (passive.board [i].currentHealth ?? 0) - dmg
+                    }
                 }
-                passive.board.removeAll { ($0.currentHealth ?? 0) <= 0 }
+                removeDeadCreatures (for: &passive, healingOwner: &active)
                 log ("Poseidon's Tide deals 2 to all enemy creatures!")
             }
 
@@ -870,9 +989,13 @@ class GameState: ObservableObject {
         var atkDmg = player.board [attackerIdx].currentAttack ?? 0
         var defDmg = opponent.board [defenderIdx].currentAttack ?? 0
 
-        // Achilles deals and takes double damage.
-        if atkName == "Achilles" { atkDmg *= 2 }
-        if defName == "Achilles" { defDmg *= 2 }
+        // Achilles deals double damage AND takes double damage in return.
+        // When Achilles is the attacker: atkDmg doubles (he hits harder) and
+        // defDmg doubles (he is more vulnerable).
+        // When Achilles is the defender: atkDmg doubles (he takes double incoming
+        // damage) and defDmg doubles (he hits back harder).
+        if atkName == "Achilles" { atkDmg *= 2; defDmg *= 2 }
+        if defName == "Achilles" { atkDmg *= 2; defDmg *= 2 }
 
         // Leonidas halves damage to adjacent creatures (min 1 to prevent zero-damage trades).
         if leonidasProtects (index: defenderIdx, on: opponent.board) { atkDmg = max (1, atkDmg / 2) }
@@ -892,23 +1015,28 @@ class GameState: ObservableObject {
             return
         }
 
-        // Athena Divine Shield: if Athena is at full base health, the first hit
-        // is completely negated. Her base `health` is decremented by 1 to "break"
-        // the shield so subsequent hits deal damage normally.
-        if defName == "Athena" {
-            let athenaCurrent = opponent.board [defenderIdx].currentHealth ?? 0
-            let athenaBase    = opponent.board [defenderIdx].health ?? 0
-            if athenaCurrent == athenaBase {
-                opponent.board [defenderIdx].health = athenaBase - 1   // Break the shield.
-                // The attacker still takes counter-damage from Athena.
-                player.board [attackerIdx].currentHealth = max (-1, (player.board [attackerIdx].currentHealth ?? 0) - defDmg)
-                player.board [attackerIdx].canAttack = false
-                log ("\(atkName) hits Athena's Divine Shield!")
-                removeDeadPlayerCreatures ()
-                attackerIndex = nil
-                checkWinCondition ()
-                return
-            }
+        // Athena Divine Shield (defender): if shield active, entire exchange is negated.
+        // Neither side takes any damage. Athena's health NEVER changes for shield purposes.
+        if defName == "Athena" && shieldedCreatureIDs.contains (opponent.board [defenderIdx].id) {
+            shieldedCreatureIDs.remove (opponent.board [defenderIdx].id)
+            player.board [attackerIdx].canAttack = false
+            log ("\(atkName) hits Athena's Divine Shield! No damage dealt.")
+            attackerIndex = nil
+            checkWinCondition ()
+            return
+        }
+        
+        // Athena Divine Shield (attacker): Athena deals her full damage but takes
+        // zero counter-damage on this first hit. Shield is then permanently removed.
+        if atkName == "Athena" && shieldedCreatureIDs.contains (player.board [attackerIdx].id) {
+            shieldedCreatureIDs.remove (player.board [attackerIdx].id)
+            opponent.board [defenderIdx].currentHealth = max (-1, (opponent.board [defenderIdx].currentHealth ?? 0) - atkDmg)
+            player.board [attackerIdx].canAttack = false
+            log ("Athena strikes \(defName) for \(atkDmg) — her Divine Shield absorbs the counter-attack!")
+            removeDeadOpponentCreatures ()
+            attackerIndex = nil
+            checkWinCondition ()
+            return
         }
 
         // Standard simultaneous combat: both creatures take damage.
@@ -932,8 +1060,9 @@ class GameState: ObservableObject {
         guard attackerIdx < player.board.count else { return }
         guard opponent.board.isEmpty else { log ("You must attack creatures first!"); return }
 
-        let dmg  = player.board [attackerIdx].currentAttack ?? 0
         let name = player.board [attackerIdx].name
+        let baseDmg = player.board [attackerIdx].currentAttack ?? 0
+        let dmg = name == "Achilles" ? baseDmg * 2 : baseDmg   // Achilles deals double to the hero.
         opponent.health -= dmg
         player.board [attackerIdx].canAttack = false
         log ("\(name) attacks the opponent for \(dmg) damage!")
@@ -967,29 +1096,53 @@ class GameState: ObservableObject {
     /// in edge cases where many creatures die simultaneously.
     func removeDeadPlayerCreatures () {
         let dead = player.board.filter { ($0.currentHealth ?? 0) <= 0 }
+        guard !dead.isEmpty else { return }
+        // Only trigger Hades heal if Hades himself isn't dying this same batch.
         if opponent.board.contains (where: { $0.name == "Hades" }) {
-            opponent.health = min (opponent.health + dead.count * 2, 60)
+            let healCount = dead.count
+            opponent.health += healCount * 2
+            log ("Opponent's Hades gains \(healCount * 2) health from your fallen creatures!")
         }
+        var aresDead = false
         for d in dead {
+            if d.name == "Ares"  { aresDead = true }
             if d.name == "Hydra" { spawnHydraHeads (for: &player) }
+            shieldedCreatureIDs.remove (d.id)
             player.discard.append (d)
         }
         player.board.removeAll { ($0.currentHealth ?? 0) <= 0 }
+        if aresDead {
+            for i in 0..<player.board.count {
+                player.board [i].currentAttack? -= 1
+            }
+        }
     }
 
     /// Mirrors `removeDeadPlayerCreatures()` for opponent creatures, with Hades
     /// healing applied to the player instead.
     func removeDeadOpponentCreatures () {
         let dead = opponent.board.filter { ($0.currentHealth ?? 0) <= 0 }
-        if player.board.contains (where: { $0.name == "Hades" }) {
-            player.health = min (player.health + dead.count * 2, 60)
-            if dead.count > 0 { log ("Hades gains you \(dead.count * 2) health!") }
+        guard !dead.isEmpty else { return }
+        // Only trigger Hades heal if Hades himself isn't dying this same batch.
+        let hadesInDeadBatch = dead.contains { $0.name == "Hades" }
+        if !hadesInDeadBatch && player.board.contains (where: { $0.name == "Hades" }) {
+            let healCount = dead.count
+            player.health += healCount * 2
+            log ("Hades gains you \(healCount * 2) health!")
         }
+        var aresDead = false
         for d in dead {
+            if d.name == "Ares"  { aresDead = true }
             if d.name == "Hydra" { spawnHydraHeads (for: &opponent) }
+            shieldedCreatureIDs.remove (d.id)
             opponent.discard.append (d)
         }
         opponent.board.removeAll { ($0.currentHealth ?? 0) <= 0 }
+        if aresDead {
+            for i in 0..<opponent.board.count {
+                opponent.board [i].currentAttack? -= 1
+            }
+        }
     }
 
     /// Appends two 2/1 Hydra Head tokens to the given player's board when their
@@ -997,12 +1150,37 @@ class GameState: ObservableObject {
     /// Ares attack bonus if Ares is in play.
     func spawnHydraHeads (for p: inout Player) {
         for _ in 0..<2 {
-            var head = Card (name: "Hydra Head", type: .monster, manaCost: 1, imageName: "hydra", description: "A 2/1 Hydra Head.", attack: 2, health: 1)
+            var head = Card (name: "Hydra Head", type: .monster, manaCost: 1, imageName: "hydra_head", description: "A 2/1 Hydra Head.", attack: 2, health: 1)
             head.canAttack = false
             if p.hasAres () { head.currentAttack = (head.currentAttack ?? 0) + 1 }
             p.board.append (head)
         }
         log ("Hydra spawns two 2/1 Hydra Heads!")
+    }
+
+
+    /// Removes dead creatures from `p` and fires death triggers (Hades heal,
+    /// Hydra spawning, Ares debuff) on the inout Player values.
+    /// Used by the shared `resolveSpell` path where we have inout Players
+    /// rather than the concrete `player`/`opponent` properties.
+    private func removeDeadCreatures (for p: inout Player, healingOwner owner: inout Player) {
+        let dead = p.board.filter { ($0.currentHealth ?? 0) <= 0 }
+        guard !dead.isEmpty else { return }
+        // Hades on the owner's board heals the owner for each creature that dies.
+        if owner.board.contains (where: { $0.name == "Hades" }) {
+            owner.health += dead.count * 2
+            log ("Hades gains \(dead.count * 2) health!")
+        }
+        var aresDied = false
+        for d in dead {
+            if d.name == "Ares"  { aresDied = true }
+            if d.name == "Hydra" { spawnHydraHeads (for: &p) }
+            p.discard.append (d)
+        }
+        p.board.removeAll { ($0.currentHealth ?? 0) <= 0 }
+        if aresDied {
+            for i in p.board.indices { p.board [i].currentAttack? -= 1 }
+        }
     }
 
     // MARK: - Win Condition
@@ -1022,281 +1200,680 @@ class GameState: ObservableObject {
     /// The log is capped at 30 entries by removing the oldest entry when
     /// the limit is exceeded. This prevents unbounded memory growth in very
     /// long matches without requiring a more complex data structure.
-    func log (_ message: String) {
-        self.message = message
+    /// Logs a game event.
+    ///
+    /// - Parameter queued: `true` for AI-turn messages — each is held on screen
+    ///   for `messageDisplayDuration` seconds so the player can read what the
+    ///   opponent did. `false` (default) for player-turn messages, which display
+    ///   instantly with no delay.
+    func log (_ message: String, queued: Bool = false) {
         gameLog.append (message)
         if gameLog.count > 30 { gameLog.removeFirst () }
+        if queued {
+            messageQueue.append (message)
+            drainMessageQueue ()
+        } else {
+            self.message = message
+        }
+    }
+
+    /// Drains the AI message queue one entry at a time, holding each on screen
+    /// for `messageDisplayDuration` seconds before advancing to the next.
+    private func drainMessageQueue () {
+        guard !isDisplayingMessage, !messageQueue.isEmpty else { return }
+        isDisplayingMessage = true
+        let next = messageQueue.removeFirst ()
+        self.message = next
+        DispatchQueue.main.asyncAfter (deadline: .now () + messageDisplayDuration) { [weak self] in
+            guard let self = self else { return }
+            self.isDisplayingMessage = false
+            self.drainMessageQueue ()
+        }
     }
 
     // MARK: - AI Turn Orchestration
 
-    /// Schedules the AI's card play phase and attack phase on the main queue
-    /// with time-staggered delays, simulating a deliberate opponent.
-    ///
-    /// The AI acts in two stages:
-    /// 1. **Card play** (after `playDelay`): plays all affordable cards in
-    ///    priority order via `aiPlayOptimalCards()`.
-    /// 2. **Attacks** (after `attackDelay`): executes one creature attack per
-    ///    scheduled closure, spaced 0.85 seconds apart so the player can observe
-    ///    each attack individually. The closure count is slightly over-provisioned
-    ///    (`board.count + 3`) to ensure all attackers get a turn even if tokens
-    ///    were summoned during the play phase.
-    /// 3. **End turn** (after all attacks): calls `endTurn()` to return control
-    ///    to the player.
-    ///
-    /// All closures capture `self` weakly to prevent a retain cycle in the event
-    /// the player quits mid-AI-turn. Each closure also guards `!self.isPlayerTurn`
-    /// to short-circuit safely if the game ends before the closure fires.
     func runAITurnWithDelay () {
-        let playDelay = 0.8
-
-        DispatchQueue.main.asyncAfter (deadline: .now () + playDelay) { [weak self] in
+        DispatchQueue.main.asyncAfter (deadline: .now () + 1.2) { [weak self] in
             guard let self = self, !self.isPlayerTurn else { return }
-            self.aiPlayOptimalCards ()
+            self.aiScheduleAllActions ()
+        }
+    }
+
+    /// Plans the full AI turn — what to play and what to attack — then
+    /// schedules each action as a timed closure so the player can watch.
+    private func aiScheduleAllActions () {
+        // ── Phase 1: plan card plays ─────────────────────────────────────────
+        // Build an ordered list of card indices to play this turn.
+        let playPlan = aiPlanCardPlays ()
+        let playInterval: Double = 1.4
+
+        for (nth, handIdx) in playPlan.enumerated () {
+            DispatchQueue.main.asyncAfter (deadline: .now () + Double (nth) * playInterval) { [weak self] in
+                guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
+                // Re-resolve the index in case earlier plays shifted the hand.
+                self.aiPlayCard (at: handIdx - playPlan.prefix (nth).filter { $0 < handIdx }.count)
+            }
         }
 
-        let attackDelay   = playDelay + 1.4
-        let creatureCount = max (opponent.board.count + 3, 6)   // Over-provision for tokens spawned during play.
+        // ── Phase 2: plan attacks ────────────────────────────────────────────
+        // We over-provision attack slots because tokens may have been spawned.
+        let attackStart   = Double (playPlan.count) * playInterval + 0.9
+        let maxAttacks    = 10
+        let attackInterval: Double = 1.4
 
-        for nth in 0..<creatureCount {
-            DispatchQueue.main.asyncAfter (deadline: .now () + attackDelay + Double (nth) * 0.85) { [weak self] in
-                guard let self = self, !self.isPlayerTurn else { return }
+        for nth in 0..<maxAttacks {
+            DispatchQueue.main.asyncAfter (deadline: .now () + attackStart + Double (nth) * attackInterval) { [weak self] in
+                guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
                 self.aiExecuteNextAttack ()
             }
         }
 
-        let endDelay = attackDelay + Double (creatureCount) * 0.85 + 0.8
-        DispatchQueue.main.asyncAfter (deadline: .now () + endDelay) { [weak self] in
+        // ── Phase 3: end turn ────────────────────────────────────────────────
+        let endMsg   = attackStart + Double (maxAttacks) * attackInterval + 0.4
+        let endTurnT = endMsg + 1.2
+        DispatchQueue.main.asyncAfter (deadline: .now () + endMsg) { [weak self] in
+            guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
+            self.log ("Opponent ends their turn.", queued: true)
+        }
+        DispatchQueue.main.asyncAfter (deadline: .now () + endTurnT) { [weak self] in
             guard let self = self, !self.isPlayerTurn else { return }
             self.endTurn ()
         }
     }
 
-    // MARK: - AI Card Play
+    // MARK: - AI Card Play Planning
 
-    /// Plays cards from the AI's hand in descending priority order until it
-    /// can no longer afford any remaining cards.
+    /// Returns an ordered list of hand indices representing the optimal play
+    /// sequence for this turn. Ordering matters because some plays affect what
+    /// is subsequently possible (e.g. Ares buffs creatures played after him,
+    /// Medea discounts spells played after her, Zeus kills creatures that
+    /// were blocking a profitable attack).
     ///
-    /// The hand is re-sorted inside the loop on each iteration because playing
-    /// a card changes both the hand contents and available mana, potentially
-    /// making previously unaffordable cards playable or altering the optimal
-    /// play order. A `played` flag drives the loop — it continues as long as
-    /// at least one card was played in the previous pass.
-    func aiPlayOptimalCards () {
-        let sortedHand = opponent.hand.indices.sorted { a, b in
-            aiCardPriority (opponent.hand [a]) > aiCardPriority (opponent.hand [b])
-        }
+    /// Strategy:
+    ///   1. Removal spells first (Circe, Bolt, Burden, Heracles) — clear blockers
+    ///      and high-value threats before committing bodies.
+    ///   2. AoE clears next (Tide, Zeus) — wipe the board before new creatures enter.
+    ///   3. Utility (Oracle, Necromancy, Blessing) — draw, revive, heal.
+    ///   4. Enablers (Medea, then Ares) — Medea before more spells, Ares before
+    ///      more creatures so new bodies get the +1.
+    ///   5. Bodies — all remaining creatures, with high-value first.
+    ///   6. Buffs (Fire, Shield, Trojan) — after all creatures are placed.
+    private func aiPlanCardPlays () -> [Int] {
+        // Simulate the hand to decide which cards to play and in what order,
+        // without actually mutating game state.
+        var simulatedMana  = opponent.mana
+        var remainingHand  = Array (opponent.hand.enumerated ())   // (originalIndex, card)
+        var plan: [Int]    = []
 
-        var played = true
-        while played {
-            played = false
-            let affordable = sortedHand.filter { i in
-                i < opponent.hand.count && opponent.mana >= opponent.effectiveManaCost (opponent.hand [i])
+        // Helper: assign a sequencing tier (lower = play earlier).
+        func tier (_ card: Card) -> Int {
+            switch card.name {
+            case "Curse of Circe", "Sisyphus's Burden", "Heracles":  return 1   // Targeted removal
+            case "Lightning Bolt":                                   return 1   // Removal / face damage
+            case "Poseidon's Tide", "Zeus":                          return 2   // AoE clear
+            case "Oracle's Vision", "Necromancy":                    return 3   // Card advantage / value
+            case "Olympian Blessing":                                return 3   // Healing
+            case "Medea":                                            return 4   // Spell discount enabler
+            case "Ares":                                             return 5   // Creature buff aura
+            case "Achilles", "Perseus":                              return 6   // High-impact bodies
+            case "Poseidon", "Athena", "Hades", "Apollo":            return 6   // High-impact gods
+            case "Leonidas", "Medusa", "Minotaur", "Hydra":          return 7   // Defensive / tricky bodies
+            case "Trojan Horse":                                     return 8   // Buff / token flood
+            case "Prometheus's Fire", "Shield of Sparta":            return 8   // Buffs — last
+            default:                                                 return 7
             }
-            guard affordable.first (where: { opponent.mana >= opponent.effectiveManaCost (opponent.hand [$0]) }) != nil else { break }
-
-            // Re-sort remaining hand each iteration to account for mana changes
-            // and hand modifications from the previous play.
-            let rebuildSorted = opponent.hand.indices
-                .filter { opponent.mana >= opponent.effectiveManaCost (opponent.hand [$0]) }
-                .sorted { a, b in aiCardPriority (opponent.hand [a]) > aiCardPriority (opponent.hand [b]) }
-            guard let idx = rebuildSorted.first else { break }
-
-            aiPlayCard (at: idx)
-            played = true
-            checkWinCondition ()
-            if gameResult != .ongoing { return }
         }
+
+        // Greedy selection: repeatedly pick the highest-priority affordable card.
+        var keepGoing = true
+        while keepGoing {
+            keepGoing = false
+            // Re-score every remaining card, accounting for simulated Medea/Ares on board.
+            let hasMedeaInPlan = plan.contains { opponent.hand [$0].name == "Medea" }
+                || opponent.board.contains { $0.name == "Medea" }
+            let affordable = remainingHand.filter { (_, card) in
+                let cost = (card.type == .spell && hasMedeaInPlan)
+                    ? max (0, card.manaCost - 1) : card.manaCost
+                return simulatedMana >= cost
+            }
+            guard !affordable.isEmpty else { break }
+
+            // Sort by: (tier ASC, priority score DESC).
+            let sorted = affordable.sorted { a, b in
+                let ta = tier (a.1), tb = tier (b.1)
+                if ta != tb { return ta < tb }
+                return aiCardPriority (a.1) > aiCardPriority (b.1)
+            }
+
+            if let (origIdx, card) = sorted.first {
+                let cost = (card.type == .spell && hasMedeaInPlan)
+                    ? max (0, card.manaCost - 1) : card.manaCost
+                simulatedMana -= cost
+                plan.append (origIdx)
+                remainingHand.removeAll { $0.0 == origIdx }
+                keepGoing = true
+            }
+        }
+        return plan
     }
 
-    /// Assigns a numeric priority score to a card from the AI's perspective,
-    /// used by `aiPlayOptimalCards()` to sort the hand before each play.
+    /// Plays exactly the next card determined by aiScheduleAllActions.
+    /// Re-selecting is handled by the caller adjusting the index.
+    private func aiPlayNextCard () {
+        let sorted = opponent.hand.indices
+            .filter { opponent.mana >= opponent.effectiveManaCost (opponent.hand [$0]) }
+            .sorted { aiCardPriority (opponent.hand [$0]) > aiCardPriority (opponent.hand [$1]) }
+        guard let idx = sorted.first else { return }
+        aiPlayCard (at: idx)
+        checkWinCondition ()
+    }
+
+    // MARK: - AI Card Priority Scoring
+
+    /// Assigns a context-sensitive priority score to a card, used both for
+    /// play-order sorting and as part of the planning heuristic.
     ///
-    /// The scoring system evaluates each card based on the current board state
-    /// rather than static card power alone. For example:
-    /// - Curse of Circe scores -10 if the player has no creatures (no valid target)
-    ///   but 90 if there are creatures to transform.
-    /// - Poseidon's Tide and Zeus score higher when they can kill creatures outright.
-    /// - Lightning Bolt scores highest when it can kill a threatening player creature.
-    /// - Cards not explicitly scored fall back to a stat-efficiency formula
-    ///   `(attack + health - manaCost) * 5 + 30`, rewarding efficient bodies.
-    ///
-    /// This produces an AI that makes contextually sensible decisions without
-    /// requiring a full game-tree search.
+    /// Scores are calibrated so:
+    ///   > 100  : must-play this turn (lethal setup, critical removal)
+    ///   60-100 : strong play
+    ///   30-60  : reasonable play
+    ///   < 0    : do not play (no valid target, or strictly worse than holding)
     func aiCardPriority (_ card: Card) -> Int {
-        var score = 0
+        let myBoard        = opponent.board
+        let theirBoard     = player.board
+        let myHP           = opponent.health
+        let theirHP        = player.health
+        let myHandSize     = opponent.hand.count
+        let myBoardCount   = myBoard.count
+        var score          = 0
+
+        // ── Pre-compute useful board facts ───────────────────────────────────
+        let theirTotalAtk  = theirBoard.filter { $0.canAttack }.reduce (0) { $0 + ($1.currentAttack ?? 0) }
+        let myTotalAtk     = myBoard.filter    { $0.canAttack }.reduce (0) { $0 + ($1.currentAttack ?? 0) }
+        let theirBoardCount = theirBoard.count
+        let hasPoseidon    = theirBoard.contains { $0.name == "Poseidon" }
+        let hasMedusa      = theirBoard.contains { $0.name == "Medusa" }
+        let _ = myBoard.contains { $0.name == "Poseidon" }   // myPoseidon (unused but kept for symmetry)
+
+        // ── Am I being threatened? ───────────────────────────────────────────
+        // If the player can kill me next turn by going face, that changes priorities.
+        let lethalThreat   = theirTotalAtk >= myHP
+        let nearLethal     = theirTotalAtk >= myHP - 5
+
+        // ── Can I kill the player this turn + next? ──────────────────────────
+        let canGoFaceNow   = theirBoard.isEmpty && myTotalAtk >= theirHP
 
         switch card.name {
+
+        // ── REMOVAL / BOARD CONTROL ──────────────────────────────────────────
+
         case "Curse of Circe":
-            score = player.board.isEmpty ? -10 : 90          // Useless with no targets; excellent otherwise.
-        case "Poseidon's Tide":
-            let kills = player.board.filter { ($0.currentHealth ?? 0) <= 2 }.count
-            score = 60 + kills * 15                           // Base value + bonus per creature killed.
-        case "Zeus":
-            let zeusKills = player.board.filter { ($0.currentHealth ?? 0) <= 2 }.count
-            score = 70 + zeusKills * 20
-        case "Lightning Bolt":
-            if player.board.contains (where: { ($0.currentHealth ?? 0) <= 3 }) { score = 85 }  // Can kill a creature.
-            else if player.health <= 15 { score = 40 }                                          // Pressure the hero.
-            else { score = 30 }
+            if hasPoseidon { score = -10; break }
+            if hasMedusa   { score = 140; break }   // Remove Medusa without losing a creature.
+            if let best = theirBoard.max (by: { (($0.currentAttack ?? 0) + ($0.currentHealth ?? 0)) <
+                                               (($1.currentAttack ?? 0) + ($1.currentHealth ?? 0)) }) {
+                let combined = (best.currentAttack ?? 0) + (best.currentHealth ?? 0)
+                let urgency  = lethalThreat ? 30 : (nearLethal ? 15 : 0)
+                score = 80 + combined * 6 + urgency
+            } else {
+                score = -10
+            }
+
         case "Sisyphus's Burden":
-            let threat = player.board.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) })
-            score = player.board.isEmpty ? -10 : 50 + (threat?.currentAttack ?? 0) * 5         // Higher for bigger threats.
-        case "Shield of Sparta":
-            score = opponent.board.isEmpty ? 5 : 45
-        case "Prometheus's Fire":
-            score = opponent.board.isEmpty ? 5 : 50
-        case "Necromancy":
-            let best = opponent.discard.filter { $0.type != .spell }.max (by: { ($0.attack ?? 0) < ($1.attack ?? 0) })
-            score = best != nil ? 65 : -10                   // Only valuable if discard has creatures.
+            if hasPoseidon { score = -10; break }
+            // Strongest use: silence a creature that is about to deal lethal to me.
+            let readyThreats = theirBoard.filter { $0.canAttack }
+            let allThreats   = theirBoard
+            // Exclude creatures we can already kill this turn.
+            let myMaxAtk = myBoard.filter { $0.canAttack }.map { $0.currentAttack ?? 0 }.max () ?? 0
+            let nonKillable = readyThreats.filter { ($0.currentHealth ?? 0) > myMaxAtk }
+            let pool = nonKillable.isEmpty ? allThreats : nonKillable
+            if let best = pool.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) }) {
+                let atk = best.currentAttack ?? 0
+                let readyBonus = best.canAttack ? 25 : 0
+                let urgencyBonus = lethalThreat ? 40 : (nearLethal ? 20 : 0)
+                score = 50 + atk * 8 + readyBonus + urgencyBonus
+            } else {
+                score = -10
+            }
+
+        case "Lightning Bolt":
+            if hasPoseidon {
+                // Face damage only — worthwhile if we're near lethal on them.
+                score = (theirHP <= 6) ? 90 : (theirHP <= 12 ? 50 : 15)
+                break
+            }
+            if hasMedusa {
+                // Bolt Medusa — 3 damage softens her (4 hp), leaving her at 1 hp.
+                // If she's already at 3 or less, bolt kills her.
+                let medusaHp = theirBoard.first (where: { $0.name == "Medusa" })?.currentHealth ?? 4
+                score = medusaHp <= 3 ? 130 : 85
+                break
+            }
+            // Kill a high-value threat.
+            let boltKillable = theirBoard.filter {
+                let hp = $0.currentHealth ?? 0
+                let dmg = $0.name == "Achilles" ? 6 : 3
+                return !shieldedCreatureIDs.contains ($0.id) && hp <= dmg
+            }
+            if let bestKill = boltKillable.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) }) {
+                let threatValue = (bestKill.currentAttack ?? 0) * 8
+                let urgency = lethalThreat ? 30 : 0
+                score = 90 + threatValue + urgency
+            } else if theirHP <= 6 {
+                score = 88   // Near-lethal: go face.
+            } else if theirHP <= 12 {
+                // Chip face damage if nothing better.
+                let chipValue = theirBoard.isEmpty ? 60 : 20
+                score = chipValue
+            } else {
+                score = -10   // Hold — no good target.
+            }
+
+        case "Poseidon's Tide":
+            if hasPoseidon { score = -10; break }
+            let tideKills = theirBoard.filter {
+                let hp  = $0.currentHealth ?? 0
+                let dmg = $0.name == "Achilles" ? 4 : 2
+                return !shieldedCreatureIDs.contains ($0.id) && hp <= dmg
+            }
+            let killCount = tideKills.count
+            let totalDmg  = theirBoard.reduce (0) { $0 + min (($1.currentHealth ?? 0), ($1.name == "Achilles" ? 4 : 2)) }
+            if killCount > 0 {
+                // Bonus for wiping the whole board.
+                let wipeBonus = (killCount == theirBoardCount && theirBoardCount >= 2) ? 40 : 0
+                score = 55 + killCount * 22 + wipeBonus
+            } else if theirBoardCount >= 3 {
+                // Even without kills: damaging a wide board is tempo.
+                score = 35 + totalDmg * 3
+            } else {
+                score = -10
+            }
+
+        // ── CARD ADVANTAGE ───────────────────────────────────────────────────
+
         case "Oracle's Vision":
-            score = opponent.hand.count <= 2 ? 55 : 30       // More urgent when the hand is running dry.
+            // More urgent when hand is thin; less urgent when already flooded.
+            score = myHandSize <= 2 ? 70 : (myHandSize <= 4 ? 45 : 22)
+
+        case "Necromancy":
+            let best = opponent.discard.filter { $0.type != .spell }
+                .max (by: { (($0.attack ?? 0) + ($0.health ?? 0)) < (($1.attack ?? 0) + ($1.health ?? 0)) })
+            if let b = best {
+                let power = (b.attack ?? 0) + (b.health ?? 0)
+                // Named high-value resurrections.
+                let nameBonus: Int
+                switch b.name {
+                case "Zeus", "Ares":      nameBonus = 30
+                case "Hades", "Poseidon": nameBonus = 20
+                case "Athena":            nameBonus = 25   // Returns with shield.
+                case "Achilles":          nameBonus = 15
+                default:                  nameBonus = 0
+                }
+                score = 65 + power * 5 + nameBonus
+            } else {
+                score = -10
+            }
+
         case "Olympian Blessing":
-            score = opponent.health <= 20 ? 70 : 20          // More urgent when low on health.
+            if lethalThreat { score = 120; break }   // Emergency: must heal to survive.
+            if myHP <= 10   { score = 100; break }
+            if myHP <= 18   { score = 72  }
+            else if myHP <= 25 { score = 35 }
+            else               { score = 12 }   // Mild top-off: low priority.
+
+        // ── ENABLERS ─────────────────────────────────────────────────────────
+
+        case "Medea":
+            let spells = opponent.hand.filter { $0.type == .spell }.count
+            score = 55 + spells * 9   // More spells in hand = more value.
+
         case "Trojan Horse":
-            score = opponent.board.count < 2 ? 50 : 25       // More valuable when the board is thin.
+            // Three 1/1s: good for flooding when board is thin, less so when already wide.
+            let boardRoom = 7 - myBoardCount   // Assume max board size ~7.
+            score = boardRoom >= 3 ? 50 : (boardRoom >= 1 ? 30 : -10)
+
+        case "Prometheus's Fire":
+            let readyAttackers = myBoard.filter { $0.canAttack }
+            if let best = readyAttackers.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) }) {
+                let atk = best.currentAttack ?? 0
+                // Most valuable when the +2 lets this attacker kill something it otherwise couldn't.
+                let unlockBonus = theirBoard.filter {
+                    let hp = $0.currentHealth ?? 0
+                    return hp > atk && hp <= atk + 2
+                }.count * 20
+                score = 45 + atk * 5 + unlockBonus
+            } else {
+                score = -10   // No ready attackers — useless this turn.
+            }
+
+        case "Shield of Sparta":
+            if let best = myBoard.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) }) {
+                let atk = best.currentAttack ?? 0
+                // More valuable on high-attack creatures (they're worth protecting).
+                // Extra value when shielded creature would otherwise die to opponent's attacks.
+                let survivalBonus = theirTotalAtk > (best.currentHealth ?? 0) ? 25 : 0
+                score = 35 + atk * 7 + survivalBonus
+            } else {
+                score = 5
+            }
+
+        // ── CREATURES ────────────────────────────────────────────────────────
+
+        case "Zeus":
+            let zeusDmg: (Card) -> Int = { c in c.name == "Achilles" ? 4 : 2 }
+            let zeusKills = theirBoard.filter {
+                !shieldedCreatureIDs.contains ($0.id) && ($0.currentHealth ?? 0) <= zeusDmg ($0)
+            }.count
+            let zeusWeakens = theirBoard.filter {
+                !shieldedCreatureIDs.contains ($0.id) && ($0.currentHealth ?? 0) > zeusDmg ($0)
+            }.count
+            score = 72 + zeusKills * 24 + zeusWeakens * 6
+
         case "Ares":
-            score = opponent.board.count >= 2 ? 80 : 55      // Much stronger with multiple creatures to buff.
+            // Extraordinarily good with creatures already on board.
+            score = myBoardCount >= 3 ? 95 : (myBoardCount >= 1 ? 78 : 58)
+
         case "Hades":
-            score = 75
+            let dyingThisBoard = (theirBoard + myBoard).filter { ($0.currentHealth ?? 0) <= 3 }.count
+            let hasBoardPressure = theirBoardCount >= 2
+            score = 70 + dyingThisBoard * 8 + (hasBoardPressure ? 15 : 0)
+
         case "Poseidon":
-            score = 70
+            // More valuable when we have many creatures to protect.
+            score = 65 + myBoardCount * 6
+
         case "Athena":
-            score = 72
+            // Divine Shield is free damage prevention — always strong.
+            score = 75
+
+        case "Apollo":
+            let healUrgency = lethalThreat ? 20 : (nearLethal ? 10 : 0)
+            score = (myHP <= 20 ? 78 : 62) + healUrgency
+
         case "Heracles":
-            let validTarget = player.board.contains (where: { ($0.currentHealth ?? 0) <= 2 })
-            score = validTarget ? 78 : 20
+            if hasPoseidon {
+                score = 32   // Enters as plain 4/4.
+            } else {
+                let targets = theirBoard.filter { ($0.currentHealth ?? 0) <= 2 }
+                if let best = targets.max (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) }) {
+                    score = 85 + (best.currentAttack ?? 0) * 10
+                } else {
+                    score = 22   // No valid target.
+                }
+            }
+
         case "Achilles":
-            score = 68
+            // Devastating when opponent board is thin or empty (can swing face).
+            // Dangerous when opponent has big creatures.
+            let faceValue = theirBoard.isEmpty ? 40 : 0
+            let killValue = theirBoard.filter { ($0.currentHealth ?? 0) <= 10 }.count * 10
+            score = 65 + faceValue + killValue
+
+        case "Odysseus":
+            score = myHandSize <= 3 ? 65 : 48
+
+        case "Perseus":
+            // Charge: attacks immediately. Strong when we need board presence or can go face.
+            let faceBonus = theirBoard.isEmpty ? 25 : 0
+            score = 68 + faceBonus
+
+        case "Leonidas":
+            // Protects adjacent creatures — huge value when we have a wide board.
+            score = myBoardCount >= 2 ? 62 : (myBoardCount >= 1 ? 50 : 38)
+
+        case "Minotaur":
+            score = 52
+
+        case "Medusa":
+            // Deters attacks entirely — very strong when opponent has attackers.
+            let deterValue = theirBoard.filter { $0.canAttack }.count * 12
+            score = 48 + deterValue
+
+        case "Hydra":
+            // 4/3 that becomes 2× 2/1 on death — great tempo.
+            score = 58
+
+        case "Cerberus":
+            // 3× 2/2: floods the board. More valuable when board is empty.
+            score = myBoardCount == 0 ? 65 : 50
+
+        case "Cyclops":
+            score = 46
+
+        case "Harpy":
+            // Only worth playing early or when mana-starved.
+            score = (opponent.mana <= 2) ? 38 : 22
+
         default:
-            // Stat efficiency formula for cards not individually tuned.
             let statValue = (card.attack ?? 0) + (card.health ?? 0) - card.manaCost
-            score = 30 + statValue * 5
+            score = 30 + statValue * 6
         }
+
+        // ── Global adjustments ───────────────────────────────────────────────
+
+        // Urgency: if I'm about to die and this card can stabilise, boost it heavily.
+        if lethalThreat && (card.name == "Olympian Blessing" || card.name == "Apollo") {
+            score += 50
+        }
+
+        // Cantrip bonus: if we're flooding and card draws more, penalise less.
+        if canGoFaceNow && card.type != .spell { score -= 10 }   // Don't flood board when lethal is ready.
 
         return score
     }
 
     // MARK: - AI Attack Execution
 
-    /// Picks and executes a single attack for the best available AI creature.
+    /// Executes the single best attack available this turn.
     ///
-    /// Attack resolution priority:
-    /// 1. If the AI can deal lethal damage to the player hero this turn
-    ///    (all attackers combined), attack the hero immediately.
-    /// 2. Otherwise, if the player has creatures, find the most favourable
-    ///    trade using `aiChooseBestTarget`.
-    /// 3. If the player's board is empty, attack the hero directly.
+    /// Priority order:
+    /// 1. Lethal: if total face damage kills the player hero right now, attack face.
+    /// 2. Lethal setup: if removing a specific blocker clears the path for lethal
+    ///    next attack, remove that blocker first.
+    /// 3. Best (attacker, target) pair by `tradeScore`.
     func aiExecuteNextAttack () {
         guard !isPlayerTurn else { return }
 
         let attackable = opponent.board.indices.filter { opponent.board [$0].canAttack }
-        guard let atkIdx = aiChooseBestAttacker (from: attackable) else { return }
+        guard !attackable.isEmpty else { return }
 
-        // Lethal check: always prioritise ending the game if possible.
-        if aiCanGoLethal (attackerIdx: atkIdx) {
-            aiAttackHero (attackerIdx: atkIdx)
+        // ── 1. Pure face lethal ──────────────────────────────────────────────
+        if player.board.isEmpty {
+            if let atkIdx = aiChooseBestAttacker (from: attackable) {
+                aiAttackHero (attackerIdx: atkIdx)
+            }
             return
         }
 
-        if !player.board.isEmpty {
-            if let defIdx = aiChooseBestTarget (attackerIdx: atkIdx) {
-                aiAttackCreature (attackerIdx: atkIdx, defenderIdx: defIdx)
-            } else {
-                // No clearly good target found — attack index 0 as a fallback.
-                aiAttackCreature (attackerIdx: atkIdx, defenderIdx: 0)
-            }
-        } else {
+        // ── 2. Check if killing any specific creature enables face lethal ────
+        //    For each target: simulate kill → compute remaining face damage → check lethal.
+        if let (atkIdx, defIdx) = aiFindLethalSetupAttack (from: attackable) {
+            aiAttackCreature (attackerIdx: atkIdx, defenderIdx: defIdx)
+            return
+        }
+
+        // ── 3. Best trade on the board ───────────────────────────────────────
+        if let (atkIdx, defIdx) = aiBestAttackPair (from: attackable) {
+            aiAttackCreature (attackerIdx: atkIdx, defenderIdx: defIdx)
+            return
+        }
+
+        // ── 4. No profitable trade — still go face if board is now clear ─────
+        //    (can happen if previous attacks cleared the board this turn)
+        if player.board.isEmpty, let atkIdx = aiChooseBestAttacker (from: attackable) {
             aiAttackHero (attackerIdx: atkIdx)
         }
     }
 
-    /// Selects the best attacker from the AI's ready creatures.
+    /// Checks whether any attack this turn can kill a creature that, once dead,
+    /// would leave the remaining attackers able to deal lethal face damage.
     ///
-    /// Prefers a creature that can kill a player creature without dying in the
-    /// trade (attack ≥ enemy health AND own health > enemy attack). If no such
-    /// favourable trade exists, falls back to the first available attacker.
-    func aiChooseBestAttacker (from attackable: [Int]) -> Int? {
-        guard !attackable.isEmpty else { return nil }
+    /// Example: player has a 1/3. AI has a 4/4 and a 3/3. Combined face dmg = 7.
+    /// If player HP = 7, removing the 1/3 with the 4/4 lets the 3/3 go face for 3.
+    /// Not lethal yet — but if player HP = 3, removing the blocker first is right.
+    ///
+    /// Returns the (attacker, target) that sets up lethal, or nil.
+    private func aiFindLethalSetupAttack (from attackable: [Int]) -> (Int, Int)? {
+        let playerHP = player.health
 
-        for i in attackable {
-            let atk  = opponent.board [i].currentAttack  ?? 0
-            for j in player.board.indices {
-                let defHp  = player.board [j].currentHealth ?? 0
-                let defAtk = player.board [j].currentAttack ?? 0
-                let myHp   = opponent.board [i].currentHealth ?? 0
-                // Favour trades where the AI creature kills but survives.
-                if atk >= defHp && defAtk < myHp { return i }
+        for atkIdx in attackable {
+            for defIdx in player.board.indices {
+                let score = tradeScore (atkIdx: atkIdx, defIdx: defIdx)
+                guard score > -100 else { continue }   // Skip Medusa suicides unless only option.
+
+                // Simulate: if this attacker kills the target, what is the remaining face damage?
+                let atkAtk = opponent.board [atkIdx].currentAttack ?? 0
+                let defHP  = player.board [defIdx].currentHealth ?? 0
+                let atkName = opponent.board [atkIdx].name
+                let defName = player.board [defIdx].name
+
+                var effectiveAtk = atkAtk
+                if atkName == "Achilles" { effectiveAtk *= 2 }
+                if defName == "Achilles" { effectiveAtk *= 2 }
+                if leonidasProtects (index: defIdx, on: player.board) { effectiveAtk = max (1, effectiveAtk / 2) }
+                let athenaShielded = defName == "Athena" && shieldedCreatureIDs.contains (player.board [defIdx].id)
+                let kills = !athenaShielded && effectiveAtk >= defHP
+
+                guard kills else { continue }   // Only consider attacks that actually kill.
+
+                // Remaining attackers after this one is used.
+                let remainingAttackers = attackable.filter { $0 != atkIdx }
+                let remainingFaceDmg = remainingAttackers.reduce (0) { sum, i in
+                    let atk = opponent.board [i].currentAttack ?? 0
+                    return sum + (opponent.board [i].name == "Achilles" ? atk * 2 : atk)
+                }
+
+                // Remaining blockers after this one dies.
+                let remainingBlockers = player.board.count - 1   // This target would be dead.
+                if remainingBlockers == 0 && remainingFaceDmg >= playerHP {
+                    return (atkIdx, defIdx)   // Found lethal setup!
+                }
             }
         }
-
-        return attackable.first   // No ideal trade found — just pick any ready attacker.
+        return nil
     }
 
-    /// Selects the best target on the player's board for the given AI attacker.
-    ///
-    /// The scoring formula evaluates four trade outcomes in descending value:
-    /// 1. **Kill and survive** (score 100 + target attack): ideal trade.
-    /// 2. **Kill but die** (score 40 + target attack): acceptable if the target is threatening.
-    /// 3. **Survive but don't kill** (score 20): chip damage, low priority.
-    /// 4. **Die without killing** (score -20 + target health): only if no better option.
-    ///
-    /// Minotaur taunt is applied first — if the player has a Minotaur, the AI
-    /// is forced to target it before considering other creatures.
-    ///
-    /// Named card modifiers applied to the score:
-    /// - **Medusa**: -200 — the AI will never willingly attack Medusa.
-    /// - **Zeus, Ares, Poseidon**: bonuses for eliminating high-value targets.
-    func aiChooseBestTarget (attackerIdx: Int) -> Int? {
-        guard attackerIdx < opponent.board.count else { return nil }
-        let atk  = opponent.board [attackerIdx].currentAttack  ?? 0
-        let myHp = opponent.board [attackerIdx].currentHealth ?? 0
-
-        // Minotaur taunt forces the AI to target it.
-        if player.board.contains (where: { $0.name == "Minotaur" }) {
-            return player.board.firstIndex (where: { $0.name == "Minotaur" })
+    /// Jointly selects the best (attacker, target) pair from all possible combinations.
+    func aiBestAttackPair (from attackable: [Int]) -> (Int, Int)? {
+        // Minotaur taunt: forced target.
+        if player.board.contains (where: { $0.name == "Minotaur" }),
+           let minoIdx = player.board.firstIndex (where: { $0.name == "Minotaur" }) {
+            let best = attackable.max (by: { a, b in
+                tradeScore (atkIdx: a, defIdx: minoIdx) < tradeScore (atkIdx: b, defIdx: minoIdx)
+            })
+            guard let atkIdx = best else { return nil }
+            // Even vs Minotaur, don't attack if it's pure suicide.
+            return tradeScore (atkIdx: atkIdx, defIdx: minoIdx) >= -10 ? (atkIdx, minoIdx) : nil
         }
 
         var bestScore = Int.min
-        var bestIdx: Int? = nil
+        var bestPair: (Int, Int)? = nil
 
-        for j in player.board.indices {
-            let defHp  = player.board [j].currentHealth ?? 0
-            let defAtk = player.board [j].currentAttack ?? 0
-            var score  = 0
-
-            let kills    = atk >= defHp
-            let survives = myHp > defAtk
-
-            if kills && survives   { score = 100 + defAtk * 10 }   // Best: kill and live.
-            else if kills          { score = 40  + defAtk * 5  }   // Trade: kill but die.
-            else if survives       { score = 20                 }   // Chip: survive but don't kill.
-            else                   { score = -20 + defHp       }   // Worst: die without killing.
-
-            // Named card score adjustments.
-            if player.board [j].name == "Medusa"   { score -= 200 }   // Never attack Medusa voluntarily.
-            if player.board [j].name == "Zeus"      { score += 30  }   // Prioritise eliminating Zeus.
-            if player.board [j].name == "Ares"      { score += 25  }   // Prioritise eliminating Ares.
-            if player.board [j].name == "Poseidon"  { score += 20  }
-
-            if score > bestScore { bestScore = score; bestIdx = j }
+        for atkIdx in attackable {
+            for defIdx in player.board.indices {
+                let s = tradeScore (atkIdx: atkIdx, defIdx: defIdx)
+                // Minimum-force tie-break: prefer lower-attack attacker to conserve power.
+                let atkAtk = opponent.board [atkIdx].currentAttack ?? 0
+                let curAtk = bestPair.map { opponent.board [$0.0].currentAttack ?? 0 } ?? Int.max
+                if s > bestScore || (s == bestScore && atkAtk < curAtk) {
+                    bestScore = s
+                    bestPair  = (atkIdx, defIdx)
+                }
+            }
         }
 
-        return bestIdx
+        // Minimum threshold: don't attack if the best outcome is still losing the attacker
+        // without compensation. Chip damage (-20) is allowed; pure suicide (-30+) is not
+        // unless named bonuses pushed the score positive.
+        guard bestScore >= -10 else { return nil }
+        return bestPair
     }
 
-    /// Returns `true` if the combined attack power of all the AI's ready creatures
-    /// is enough to reduce the player's health to 0 or below — i.e. the AI can
-    /// win the game this turn if it attacks the hero with everything.
-    ///
-    /// Only valid when the player's board is empty (direct attacks are illegal
-    /// otherwise), which is enforced by the guard in `aiExecuteNextAttack`.
-    func aiCanGoLethal (attackerIdx: Int) -> Bool {
-        guard attackerIdx < opponent.board.count else { return false }
-        guard player.board.isEmpty else { return false }
-        let totalDamage = opponent.board.filter { $0.canAttack }.reduce (0) { $0 + ($1.currentAttack ?? 0) }
-        return totalDamage >= player.health
+    /// Scores a single (attacker, target) combat pair from the AI's perspective.
+    /// Full accounting: Achilles doubling, Leonidas halving, Athena shield, Medusa, name bonuses.
+    private func tradeScore (atkIdx: Int, defIdx: Int) -> Int {
+        guard atkIdx < opponent.board.count, defIdx < player.board.count else { return Int.min }
+
+        let atkName  = opponent.board [atkIdx].name
+        let defName  = player.board  [defIdx].name
+        let myHp     = opponent.board [atkIdx].currentHealth ?? 0
+        let defHp    = player.board   [defIdx].currentHealth ?? 0
+
+        var effectiveAtk = opponent.board [atkIdx].currentAttack ?? 0
+        var effectiveDef = player.board   [defIdx].currentAttack ?? 0
+
+        if atkName == "Achilles" { effectiveAtk *= 2; effectiveDef *= 2 }
+        if defName == "Achilles" { effectiveAtk *= 2; effectiveDef *= 2 }
+
+        if leonidasProtects (index: defIdx, on: player.board)   { effectiveAtk = max (1, effectiveAtk / 2) }
+        if leonidasProtects (index: atkIdx, on: opponent.board) { effectiveDef = max (1, effectiveDef / 2) }
+
+        let athenaShielded = defName == "Athena" && shieldedCreatureIDs.contains (player.board [defIdx].id)
+        let kills    = !athenaShielded && effectiveAtk >= defHp
+        let survives = myHp > effectiveDef
+
+        // Medusa: attacker is instantly destroyed.
+        if defName == "Medusa" {
+            let onlyMedusa = player.board.allSatisfy { $0.name == "Medusa" }
+            if onlyMedusa {
+                // Sacrifice weakest to clear the board.
+                let weakestAtk = opponent.board.filter { $0.canAttack }
+                    .min (by: { ($0.currentAttack ?? 0) < ($1.currentAttack ?? 0) })?.currentAttack ?? 0
+                return (effectiveAtk == weakestAtk) ? 5 : -150
+            }
+            return -150
+        }
+
+        var score: Int
+        if kills && survives   { score = 100 + (player.board [defIdx].currentAttack ?? 0) * 10 }
+        else if kills          { score = 40  + (player.board [defIdx].currentAttack ?? 0) * 5  }
+        else if survives       { score = -20 }   // Chip damage — allowed.
+        else                   { score = -30 }   // Suicidal — named bonuses may redeem it.
+
+        // Wasting a hit on a shielded Athena breaks shield but deals no damage.
+        if athenaShielded    { score = max (score, -40) }
+
+        // Named card threat bonuses.
+        if defName == "Zeus"     { score += 40 }   // Removing Zeus before he AoEs next turn is huge.
+        if defName == "Ares"     { score += 35 }   // Ares passively pumps everything.
+        if defName == "Hades"    { score += 30 }   // Hades heals opponent for every death.
+        if defName == "Poseidon" { score += 28 }   // Shutting down spells hurts hard.
+        if defName == "Apollo"   { score += 22 }   // Ongoing heal engine.
+        if defName == "Achilles" { score += 18 }   // Double-damage threat.
+        if defName == "Leonidas" { score += 15 }   // Halving attack is a major tempo swing.
+
+        // Penalise attacking into a shielded Athena unless there is no better option.
+        if athenaShielded && kills { score -= 20 }   // It breaks shield but doesn't kill — net loss.
+
+        return score
     }
+
+    /// Selects the highest face-damage attacker (used when player board is empty).
+    func aiChooseBestAttacker (from attackable: [Int]) -> Int? {
+        guard !attackable.isEmpty else { return nil }
+        return attackable.max (by: {
+            let dmgA = opponent.board [$0].name == "Achilles"
+                ? (opponent.board [$0].currentAttack ?? 0) * 2 : (opponent.board [$0].currentAttack ?? 0)
+            let dmgB = opponent.board [$1].name == "Achilles"
+                ? (opponent.board [$1].currentAttack ?? 0) * 2 : (opponent.board [$1].currentAttack ?? 0)
+            return dmgA < dmgB
+        })
+    }
+
+    /// Kept for legacy call sites; delegates to `aiBestAttackPair`.
+    func aiChooseBestTarget (attackerIdx: Int) -> Int? {
+        let attackable = opponent.board.indices.filter { opponent.board [$0].canAttack }
+        return aiBestAttackPair (from: attackable).map { $0.1 }
+    }
+
+    func aiCanGoLethal (attackerIdx: Int) -> Bool {
+        guard player.board.isEmpty else { return false }
+        let total = opponent.board.filter { $0.canAttack }.reduce (0) { $0 + ($1.currentAttack ?? 0) }
+        return total >= player.health
+    }
+
 
     // MARK: - AI Card Execution
 
@@ -1323,8 +1900,9 @@ class GameState: ObservableObject {
             var played = card
             played.canAttack = (card.name == "Perseus")   // Perseus has Charge; all others have summoning sickness.
             if opponent.hasAres () && card.name != "Ares" { played.currentAttack = (played.currentAttack ?? 0) + 1 }
+            if card.name == "Athena" { shieldedCreatureIDs.insert (played.id) }
             opponent.board.append (played)
-            log ("Opponent played \(card.name).")
+            log ("Opponent played \(card.name).", queued: true)
             aiResolvePlayEffect (card)
         }
         checkWinCondition ()
@@ -1339,7 +1917,16 @@ class GameState: ObservableObject {
     func aiResolvePlayEffect (_ card: Card) {
         switch card.name {
         case "Zeus":
-            for i in player.board.indices { player.board [i].currentHealth = (player.board [i].currentHealth ?? 0) - 2 }
+            // Zeus is a CREATURE ability — Poseidon only blocks spells.
+            for i in player.board.indices {
+                let dmg = player.board [i].name == "Achilles" ? 4 : 2
+                if player.board [i].name == "Athena" && shieldedCreatureIDs.contains (player.board [i].id) {
+                    shieldedCreatureIDs.remove (player.board [i].id)
+                    log ("Opponent's Zeus hits your Athena's Divine Shield!", queued: true)
+                } else {
+                    player.board [i].currentHealth = (player.board [i].currentHealth ?? 0) - dmg
+                }
+            }
             removeDeadPlayerCreatures ()
 
         case "Ares":
@@ -1348,12 +1935,17 @@ class GameState: ObservableObject {
             }
 
         case "Heracles":
-            // AI Heracles automatically targets the first player creature with ≤ 2 health.
-            if let t = player.board.firstIndex (where: { ($0.currentHealth ?? 0) <= 2 }) {
+            // Poseidon blocks the destroy ability — Heracles enters as a plain 4/4.
+            if player.board.contains (where: { $0.name == "Poseidon" }) {
+                log ("Opponent's Heracles is blocked by your Poseidon — enters as a 4/4.", queued: true)
+            } else if let t = player.board.indices
+                .filter ({ (player.board [$0].currentHealth ?? 0) <= 2 })
+                .max (by: { (player.board [$0].currentAttack ?? 0) < (player.board [$1].currentAttack ?? 0) }) {
+                // Target highest-attack creature with ≤ 2 health for maximum impact.
                 let name = player.board [t].name
                 player.discard.append (player.board [t])
                 player.board.remove (at: t)
-                log ("Opponent's Heracles destroys \(name)!")
+                log ("Opponent's Heracles destroys your \(name)!", queued: true)
             }
 
         case "Cerberus":
@@ -1390,36 +1982,75 @@ class GameState: ObservableObject {
     func aiResolveSpell (_ card: Card) {
         switch card.name {
         case "Lightning Bolt":
-            // Prefer to kill; otherwise deal damage to the biggest threat; last resort: face.
+            if player.board.contains (where: { $0.name == "Poseidon" }) {
+                player.health -= 3
+                log ("Opponent's Lightning Bolt hits you for 3 (Poseidon blocks creatures)!", queued: true)
+                break
+            }
+            // Medusa: bolt her first — it's the safest removal. She has 4 hp so bolt
+            // won't always kill her outright, but it damages her safely for a follow-up.
+            if let medusaIdx = player.board.firstIndex (where: { $0.name == "Medusa" }) {
+                let newHp = (player.board [medusaIdx].currentHealth ?? 0) - 3
+                player.board [medusaIdx].currentHealth = newHp
+                if newHp <= 0 {
+                    log ("Opponent's Lightning Bolt destroys your Medusa!", queued: true)
+                } else {
+                    log ("Opponent's Lightning Bolt hits your Medusa for 3!", queued: true)
+                }
+                removeDeadPlayerCreatures ()
+                break
+            }
+            // Otherwise prefer to kill the highest-attack creature within bolt range.
             let killTarget = player.board.indices.filter { ($0 < player.board.count) && (player.board [$0].currentHealth ?? 0) <= 3 }
                 .max (by: { (player.board [$0].currentAttack ?? 0) < (player.board [$1].currentAttack ?? 0) })
             if let t = killTarget {
                 let name = player.board [t].name
-                player.board [t].currentHealth = (player.board [t].currentHealth ?? 0) - 3
-                log ("Opponent's Lightning Bolt kills \(name)!")
+                let boltDmg = name == "Achilles" ? 6 : 3
+                player.board [t].currentHealth = (player.board [t].currentHealth ?? 0) - boltDmg
+                log ("Opponent's Lightning Bolt kills \(name)!", queued: true)
                 removeDeadPlayerCreatures ()
             } else if !player.board.isEmpty {
                 let t = player.board.indices.max (by: { (player.board [$0].currentAttack ?? 0) < (player.board [$1].currentAttack ?? 0) }) ?? 0
-                player.board [t].currentHealth = (player.board [t].currentHealth ?? 0) - 3
-                log ("Opponent's Lightning Bolt hits \(player.board [t].name) for 3!")
-                removeDeadPlayerCreatures ()
+                let name = player.board [t].name
+                let boltDmg = name == "Achilles" ? 6 : 3
+                if name == "Athena" && shieldedCreatureIDs.contains (player.board [t].id) {
+                    shieldedCreatureIDs.remove (player.board [t].id)
+                    log ("Opponent's Lightning Bolt hits your Athena's Divine Shield!", queued: true)
+                } else {
+                    player.board [t].currentHealth = (player.board [t].currentHealth ?? 0) - boltDmg
+                    log ("Opponent's Lightning Bolt hits \(name) for \(boltDmg)!", queued: true)
+                    removeDeadPlayerCreatures ()
+                }
             } else {
                 player.health -= 3
-                log ("Opponent's Lightning Bolt hits you for 3!")
+                log ("Opponent's Lightning Bolt hits you for 3!", queued: true)
             }
 
         case "Poseidon's Tide":
-            for i in player.board.indices { player.board [i].currentHealth = (player.board [i].currentHealth ?? 0) - 2 }
-            log ("Opponent's Poseidon's Tide deals 2 to all your creatures!")
-            removeDeadPlayerCreatures ()
+            // Blocked if the player has Poseidon on the board — same rule as player-cast Tide.
+            if player.board.contains (where: { $0.name == "Poseidon" }) {
+                log ("Your Poseidon protects your creatures — opponent's Tide is blocked!", queued: true)
+            } else {
+                for i in player.board.indices {
+                    let dmg = player.board [i].name == "Achilles" ? 4 : 2
+                    if player.board [i].name == "Athena" && shieldedCreatureIDs.contains (player.board [i].id) {
+                        shieldedCreatureIDs.remove (player.board [i].id)
+                        log ("Opponent's Poseidon's Tide hits your Athena's Divine Shield!", queued: true)
+                    } else {
+                        player.board [i].currentHealth = (player.board [i].currentHealth ?? 0) - dmg
+                    }
+                }
+                log ("Opponent's Poseidon's Tide deals 2 to all your creatures!", queued: true)
+                removeDeadPlayerCreatures ()
+            }
 
         case "Oracle's Vision":
             opponent.drawCard (); opponent.drawCard ()
-            log ("Opponent uses Oracle's Vision to draw 2 cards.")
+            log ("Opponent uses Oracle's Vision to draw 2 cards.", queued: true)
 
         case "Olympian Blessing":
-            opponent.health = min (opponent.health + 5, 30)
-            log ("Opponent heals 5 with Olympian Blessing!")
+            opponent.health += 5
+            log ("Opponent heals 5 with Olympian Blessing!", queued: true)
 
         case "Trojan Horse":
             for _ in 0..<3 {
@@ -1428,42 +2059,64 @@ class GameState: ObservableObject {
                 if opponent.hasAres () { s.currentAttack = (s.currentAttack ?? 0) + 1 }
                 opponent.board.append (s)
             }
-            log ("Opponent plays Trojan Horse — three soldiers appear!")
+            log ("Opponent plays Trojan Horse — three soldiers appear!", queued: true)
 
         case "Shield of Sparta":
             // Buff the AI's highest-attack creature for maximum offensive retention.
             if let i = opponent.board.indices.max (by: { (opponent.board [$0].currentAttack ?? 0) < (opponent.board [$1].currentAttack ?? 0) }) {
                 opponent.board [i].currentHealth = (opponent.board [i].currentHealth ?? 0) + 3
                 opponent.board [i].health = (opponent.board [i].health ?? 0) + 3
-                log ("Opponent's Shield of Sparta buffs \(opponent.board [i].name) with +3 health!")
+                log ("Opponent's Shield of Sparta buffs \(opponent.board [i].name) with +3 health!", queued: true)
             }
 
         case "Prometheus's Fire":
-            if let i = opponent.board.indices.max (by: { (opponent.board [$0].currentAttack ?? 0) < (opponent.board [$1].currentAttack ?? 0) }) {
+            // Only buff a creature that can attack this turn — useless otherwise.
+            let fireTargets = opponent.board.indices.filter { opponent.board [$0].canAttack == true }
+            if let i = fireTargets.max (by: { (opponent.board [$0].currentAttack ?? 0) < (opponent.board [$1].currentAttack ?? 0) }) {
                 opponent.board [i].currentAttack = (opponent.board [i].currentAttack ?? 0) + 2
-                log ("Opponent's Prometheus's Fire gives \(opponent.board [i].name) +2 attack!")
+                log ("Opponent's Prometheus's Fire gives \(opponent.board [i].name) +2 attack!", queued: true)
+                let fireID = opponent.board [i].id
+                fireCreatureIDs.insert (fireID)
             }
 
         case "Curse of Circe":
-            // Transform the highest combined-stat player creature into a 1/1 pig.
+            if player.board.contains (where: { $0.name == "Poseidon" }) {
+                log ("Opponent's Curse of Circe fizzles — your Poseidon protects your creatures!", queued: true)
+                break
+            }
             if !player.board.isEmpty {
-                let t = player.board.indices.max (by: {
+                // Medusa: safest Circe target — removes her without losing a creature.
+                let medusaIdx = player.board.firstIndex (where: { $0.name == "Medusa" })
+                let t = medusaIdx ?? player.board.indices.max (by: {
                     ((player.board [$0].currentAttack ?? 0) + (player.board [$0].currentHealth ?? 0)) <
                     ((player.board [$1].currentAttack ?? 0) + (player.board [$1].currentHealth ?? 0))
                 }) ?? 0
                 let name = player.board [t].name
                 var pig = Card (name: "Pig", type: .monster, manaCost: 1, imageName: "pig", description: "A transformed 1/1 pig.", attack: 1, health: 1)
                 pig.canAttack = player.board [t].canAttack   // Preserve the transformed creature's readiness.
+                player.discard.append (player.board [t])
                 player.board [t] = pig
-                log ("Opponent's Curse of Circe transforms your \(name) into a pig!")
+                // If Ares was transformed, remove his board-wide +1 bonus
+                if name == "Ares" {
+                    for i in player.board.indices where i != t {
+                        player.board[i].currentAttack? -= 1
+                    }
+                }
+                log ("Opponent's Curse of Circe transforms your \(name) into a pig!", queued: true)
             }
 
         case "Sisyphus's Burden":
-            // Silence the highest-attack player creature.
+            // Poseidon protects player creatures from targeted spells.
+            if player.board.contains (where: { $0.name == "Poseidon" }) {
+                log ("Opponent's Sisyphus's Burden fizzles — your Poseidon protects your creatures!", queued: true)
+                break
+            }
             if !player.board.isEmpty {
                 let t = player.board.indices.max (by: { (player.board [$0].currentAttack ?? 0) < (player.board [$1].currentAttack ?? 0) }) ?? 0
+                let burdenedID = player.board [t].id
                 player.board [t].canAttack = false
-                log ("Opponent's Sisyphus's Burden stops \(player.board [t].name) from attacking!")
+                burdenedCreatureIDs.insert (burdenedID)
+                log ("Opponent's Sisyphus's Burden stops \(player.board [t].name) from attacking next turn!", queued: true)
             }
 
         case "Necromancy":
@@ -1476,9 +2129,17 @@ class GameState: ObservableObject {
                 revived.currentHealth = c.health
                 revived.currentAttack = c.attack
                 revived.canAttack = false
+                if revived.name == "Perseus" { revived.canAttack = true }
+                if revived.name == "Athena"  { revived.id = UUID ().uuidString; shieldedCreatureIDs.insert (revived.id) }
                 if opponent.hasAres () { revived.currentAttack = (revived.currentAttack ?? 0) + 1 }
+                // If the revived creature IS Ares, grant +1 attack to all existing board creatures.
+                if revived.name == "Ares" {
+                    for i in opponent.board.indices {
+                        opponent.board [i].currentAttack = (opponent.board [i].currentAttack ?? 0) + 1
+                    }
+                }
                 opponent.board.append (revived)
-                log ("Opponent's Necromancy revives \(revived.name)!")
+                log ("Opponent's Necromancy revives \(revived.name)!", queued: true)
             }
 
         default:
@@ -1515,8 +2176,10 @@ class GameState: ObservableObject {
         var atkDmg = opponent.board [attackerIdx].currentAttack ?? 0
         var defDmg = player.board [defenderIdx].currentAttack ?? 0
 
-        if atkName == "Achilles" { atkDmg *= 2 }
-        if defName == "Achilles" { defDmg *= 2 }
+        // Achilles deals double AND takes double damage regardless of whether
+        // he is the attacker or defender.
+        if atkName == "Achilles" { atkDmg *= 2; defDmg *= 2 }
+        if defName == "Achilles" { atkDmg *= 2; defDmg *= 2 }
 
         if leonidasProtects (index: defenderIdx, on: player.board)   { atkDmg = max (1, atkDmg / 2) }
         if leonidasProtects (index: attackerIdx, on: opponent.board) { defDmg = max (1, defDmg / 2) }
@@ -1526,34 +2189,39 @@ class GameState: ObservableObject {
             opponent.board [attackerIdx].currentHealth = -1
             opponent.board [attackerIdx].canAttack = false
             player.board [defenderIdx].currentHealth = max (-1, (player.board [defenderIdx].currentHealth ?? 0) - atkDmg)
-            log ("Opponent's \(atkName) attacks Medusa and is destroyed!")
+            log ("Opponent's \(atkName) attacks Medusa and is destroyed!", queued: true)
             removeDeadOpponentCreatures ()
             removeDeadPlayerCreatures ()
             checkWinCondition ()
             return
         }
 
-        // Athena Divine Shield: absorb first hit at full health.
-        if defName == "Athena" {
-            let athenaCurrent = player.board [defenderIdx].currentHealth ?? 0
-            let athenaBase    = player.board [defenderIdx].health ?? 0
-            if athenaCurrent == athenaBase {
-                player.board [defenderIdx].health = athenaBase - 1
-                opponent.board [attackerIdx].currentHealth = max (-1, (opponent.board [attackerIdx].currentHealth ?? 0) - defDmg)
-                opponent.board [attackerIdx].canAttack = false
-                log ("Opponent hits your Athena's Divine Shield!")
-                removeDeadOpponentCreatures ()
-                checkWinCondition ()
-                return
-            }
+        // Athena Divine Shield (defender): entire exchange negated. No health changes.
+        if defName == "Athena" && shieldedCreatureIDs.contains (player.board [defenderIdx].id) {
+            shieldedCreatureIDs.remove (player.board [defenderIdx].id)
+            opponent.board [attackerIdx].canAttack = false
+            log ("Opponent's \(atkName) hits your Athena's Divine Shield! No damage dealt.", queued: true)
+            checkWinCondition ()
+            return
         }
-
+        
+        // Athena Divine Shield (attacker): deals full damage, absorbs counter-attack.
+        if atkName == "Athena" && shieldedCreatureIDs.contains (opponent.board [attackerIdx].id) {
+            shieldedCreatureIDs.remove (opponent.board [attackerIdx].id)
+            player.board [defenderIdx].currentHealth = max (-1, (player.board [defenderIdx].currentHealth ?? 0) - atkDmg)
+            opponent.board [attackerIdx].canAttack = false
+            log ("Opponent's Athena strikes \(defName) for \(atkDmg) — Divine Shield absorbs counter-attack!", queued: true)
+            removeDeadPlayerCreatures ()
+            checkWinCondition ()
+            return
+        }
+        
         // Standard simultaneous combat.
         player.board [defenderIdx].currentHealth   = max (-1, (player.board [defenderIdx].currentHealth ?? 0) - atkDmg)
         opponent.board [attackerIdx].currentHealth = max (-1, (opponent.board [attackerIdx].currentHealth ?? 0) - defDmg)
         opponent.board [attackerIdx].canAttack = false
 
-        log ("Opponent's \(atkName) attacks your \(defName)!")
+        log ("Opponent's \(atkName) attacks your \(defName)!", queued: true)
         removeDeadPlayerCreatures ()
         removeDeadOpponentCreatures ()
         checkWinCondition ()
@@ -1566,11 +2234,12 @@ class GameState: ObservableObject {
     /// is retained as a defensive check.
     func aiAttackHero (attackerIdx: Int) {
         guard attackerIdx < opponent.board.count, player.board.isEmpty else { return }
-        let dmg  = opponent.board [attackerIdx].currentAttack ?? 0
         let name = opponent.board [attackerIdx].name
+        let baseDmg = opponent.board [attackerIdx].currentAttack ?? 0
+        let dmg = name == "Achilles" ? baseDmg * 2 : baseDmg   // Achilles deals double to the hero.
         player.health -= dmg
         opponent.board [attackerIdx].canAttack = false
-        log ("Opponent's \(name) attacks you for \(dmg) damage!")
+        log ("Opponent's \(name) attacks you for \(dmg) damage!", queued: true)
         checkWinCondition ()
     }
 

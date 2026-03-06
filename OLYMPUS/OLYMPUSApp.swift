@@ -44,11 +44,6 @@ struct OLYMPUSApp: App {
                 // fixed regardless of frame timing or animation curves.
                 LaunchScreenView ()
                     .onAppear {
-                        // Force portrait orientation
-                        UIDevice.current.setValue(
-                            UIInterfaceOrientation.portrait.rawValue,
-                            forKey: "orientation"
-                        )
                         DispatchQueue.main.asyncAfter (deadline: .now () + 5) {
                             // `.easeInOut` produces a smooth cross-dissolve between
                             // the splash and the main menu. SwiftUI automatically
@@ -62,13 +57,6 @@ struct OLYMPUSApp: App {
             } else {
                 // MARK: Main Menu
                 ContentView ()
-                    .onAppear {
-                        // Keep app locked to portrait
-                        UIDevice.current.setValue(
-                            UIInterfaceOrientation.portrait.rawValue,
-                            forKey: "orientation"
-                        )
-                    }
             }
         }
     }
