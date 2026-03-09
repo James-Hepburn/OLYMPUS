@@ -232,7 +232,7 @@ class GameState: ObservableObject {
     private var isDisplayingMessage = false
 
     /// Minimum time (seconds) each message stays on screen before the next replaces it.
-    private let messageDisplayDuration: TimeInterval = 1.6
+    private let messageDisplayDuration: TimeInterval = 1.0
 
     /// A rolling history of the last 30 game events. Capped to prevent
     /// unbounded memory growth in long matches.
@@ -1244,25 +1244,28 @@ class GameState: ObservableObject {
     /// schedules each action as a timed closure so the player can watch.
     private func aiScheduleAllActions () {
         // ── Phase 1: plan card plays ─────────────────────────────────────────
-        // Build an ordered list of card indices to play this turn.
-        let playPlan = aiPlanCardPlays ()
-        let playInterval: Double = 1.4
+        let playPlan      = aiPlanCardPlays ()
+        let playInterval: Double = 0.9
 
         for (nth, handIdx) in playPlan.enumerated () {
             DispatchQueue.main.asyncAfter (deadline: .now () + Double (nth) * playInterval) { [weak self] in
                 guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
-                // Re-resolve the index in case earlier plays shifted the hand.
                 self.aiPlayCard (at: handIdx - playPlan.prefix (nth).filter { $0 < handIdx }.count)
             }
         }
 
         // ── Phase 2: plan attacks ────────────────────────────────────────────
-        // We over-provision attack slots because tokens may have been spawned.
-        let attackStart   = Double (playPlan.count) * playInterval + 0.9
-        let maxAttacks    = 10
-        let attackInterval: Double = 1.4
+        // Count actual ready attackers now, plus a small buffer for tokens that
+        // may be spawned during the play phase (Cerberus → 3 heads, Trojan Horse → 3 soldiers).
+        // This replaces the old fixed over-provision of 10 slots, which caused the AI
+        // to sit in silence for several seconds on turns where it had few or no attackers.
+        let attackStart    = Double (playPlan.count) * playInterval + 0.6
+        let attackInterval: Double = 0.9
+        let knownAttackers = opponent.board.filter { $0.canAttack }.count
+        // Buffer of 4 covers any tokens spawned during the play phase.
+        let attackSlots    = knownAttackers + 4
 
-        for nth in 0..<maxAttacks {
+        for nth in 0..<attackSlots {
             DispatchQueue.main.asyncAfter (deadline: .now () + attackStart + Double (nth) * attackInterval) { [weak self] in
                 guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
                 self.aiExecuteNextAttack ()
@@ -1270,8 +1273,8 @@ class GameState: ObservableObject {
         }
 
         // ── Phase 3: end turn ────────────────────────────────────────────────
-        let endMsg   = attackStart + Double (maxAttacks) * attackInterval + 0.4
-        let endTurnT = endMsg + 1.2
+        let endMsg   = attackStart + Double (attackSlots) * attackInterval + 0.3
+        let endTurnT = endMsg + 0.8
         DispatchQueue.main.asyncAfter (deadline: .now () + endMsg) { [weak self] in
             guard let self = self, !self.isPlayerTurn, self.gameResult == .ongoing else { return }
             self.log ("Opponent ends their turn.", queued: true)
